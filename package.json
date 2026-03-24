@@ -1,10 +1,11 @@
 {
   "name": "smart-home-vue-three",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:backend": "python3 -m uvicorn backend.app.main:app --reload --app-dir .",
     "build": "vite build",
     "preview": "vite preview"
   },
