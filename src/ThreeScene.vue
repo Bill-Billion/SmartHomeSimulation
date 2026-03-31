@@ -2,21 +2,25 @@
   <div class="scene-shell">
     <div class="scene-toolbar">
       <span class="scene-label">{{ sceneLabel }}</span>
-      <button @click="highlightNextComponent" :disabled="allMeshes.length === 0">
-        高亮下一个组件
-      </button>
+      <div class="toolbar-actions">
+        <button @click="resetView" :disabled="!modelScene">重置视角</button>
+        <button @click="highlightNextComponent" :disabled="allMeshes.length === 0">
+          高亮下一个组件
+        </button>
+      </div>
     </div>
 
     <div class="scene-loading" v-if="isLoading">模型加载中</div>
     <div class="scene-error" v-if="loadError">{{ loadError }}</div>
 
     <TresCanvas shadows alpha>
-      <TresPerspectiveCamera :position="cameraPosition" :look-at="[0, 0, 0]" />
+      <TresPerspectiveCamera :position="cameraPosition" :look-at="cameraTarget" />
       <OrbitControls ref="controlsRef" />
 
-      <TresAmbientLight :intensity="1.35" />
-      <TresDirectionalLight :position="[14, 20, 10]" :intensity="1.75" cast-shadow />
-      <TresDirectionalLight :position="[-10, 12, -8]" :intensity="0.65" />
+      <TresAmbientLight :intensity="1.05" />
+      <TresDirectionalLight :position="[12, 18, 11]" :intensity="1.45" cast-shadow />
+      <TresDirectionalLight :position="[-8, 14, 7]" :intensity="0.82" />
+      <TresDirectionalLight :position="[4, 9, -10]" :intensity="0.45" />
 
       <primitive :object="modelScene" v-if="modelScene" />
     </TresCanvas>
@@ -38,15 +42,22 @@ const props = defineProps({
   sceneLabel: {
     type: String,
     default: '默认示例场景'
+  },
+  sceneCamera: {
+    type: Object,
+    default: null
   }
 });
 
 const controlsRef = ref(null);
 const modelScene = shallowRef(null);
 const cameraPosition = ref([8, 14, 9]);
+const cameraTarget = ref([0, 0, 0]);
 const isLoading = ref(false);
 const loadError = ref('');
 const allMeshes = ref([]);
+const modelCenter = ref(new THREE.Vector3(0, 0, 0));
+const modelMaxDim = ref(6);
 let highlightIndex = -1;
 
 function resetHighlight() {
@@ -77,24 +88,61 @@ function processModel(scene) {
   const box = new THREE.Box3().setFromObject(scene);
   const center = box.getCenter(new THREE.Vector3());
   const size = box.getSize(new THREE.Vector3());
+  modelCenter.value = center.clone();
   scene.position.set(-center.x, -center.y, -center.z);
 
   const maxDim = Math.max(size.x, size.y, size.z, 6);
-  cameraPosition.value = [maxDim * 0.58, maxDim * 1.55, maxDim * 0.68];
+  modelMaxDim.value = maxDim;
+  syncCameraState();
 
   if (controlsRef.value?.instance) {
     controlsRef.value.instance.enableDamping = true;
     controlsRef.value.instance.minDistance = maxDim * 0.45;
     controlsRef.value.instance.maxDistance = maxDim * 3.2;
     controlsRef.value.instance.maxPolarAngle = Math.PI / 2.2;
-    controlsRef.value.instance.target.set(0, 0, 0);
-    controlsRef.value.instance.object.position.set(
-      cameraPosition.value[0],
-      cameraPosition.value[1],
-      cameraPosition.value[2]
-    );
-    controlsRef.value.instance.update();
+    applyCameraState();
   }
+}
+
+function syncCameraState() {
+  const fallbackPosition = [modelMaxDim.value * 0.58, modelMaxDim.value * 1.55, modelMaxDim.value * 0.68];
+  const fallbackTarget = [0, 0, 0];
+  if (props.sceneCamera?.position && props.sceneCamera?.target) {
+    cameraPosition.value = [
+      props.sceneCamera.position.x - modelCenter.value.x,
+      props.sceneCamera.position.y - modelCenter.value.y,
+      props.sceneCamera.position.z - modelCenter.value.z
+    ];
+    cameraTarget.value = [
+      props.sceneCamera.target.x - modelCenter.value.x,
+      props.sceneCamera.target.y - modelCenter.value.y,
+      props.sceneCamera.target.z - modelCenter.value.z
+    ];
+    return;
+  }
+  cameraPosition.value = fallbackPosition;
+  cameraTarget.value = fallbackTarget;
+}
+
+function applyCameraState() {
+  if (!controlsRef.value?.instance) {
+    return;
+  }
+  controlsRef.value.instance.target.set(
+    cameraTarget.value[0],
+    cameraTarget.value[1],
+    cameraTarget.value[2]
+  );
+  controlsRef.value.instance.object.position.set(
+    cameraPosition.value[0],
+    cameraPosition.value[1],
+    cameraPosition.value[2]
+  );
+  controlsRef.value.instance.update();
+}
+
+function resetView() {
+  applyCameraState();
 }
 
 function loadModel(modelUrl) {
@@ -154,6 +202,16 @@ watch(
   },
   { immediate: true }
 );
+
+watch(
+  () => props.sceneCamera,
+  () => {
+    if (modelScene.value) {
+      syncCameraState();
+      resetView();
+    }
+  }
+);
 </script>
 
 <style scoped>
@@ -172,6 +230,11 @@ watch(
   display: flex;
   align-items: center;
   justify-content: space-between;
+}
+
+.toolbar-actions {
+  display: flex;
+  gap: 10px;
 }
 
 .scene-label {

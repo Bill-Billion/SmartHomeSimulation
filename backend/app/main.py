@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
 from .config import SUPPORTED_UPLOAD_EXTENSIONS
+from .llm_enhancer import LlmRequestConfig, apply_scene_llm_enhancements
 from .models import JobRecord, JobStatus, SourceType, utc_now_iso
 from .parsers import UnsupportedFormatError, parse_floorplan
 from .scene_builder import build_scene_spec, export_scene_glb
@@ -18,7 +19,7 @@ def create_app(data_root: Path | None = None) -> FastAPI:
     app = FastAPI(
         title="Smart Home Floorplan Generator",
         description="上传 CAD 或平面图并生成可预览 3D 场景。",
-        version="0.1.1",
+        version="0.1.6",
     )
     app.add_middleware(
         CORSMiddleware,
@@ -32,6 +33,10 @@ def create_app(data_root: Path | None = None) -> FastAPI:
     async def generate_floorplan(
         background_tasks: BackgroundTasks,
         file: UploadFile = File(...),
+        llm_enabled: bool = Form(False),
+        llm_base_url: str | None = Form(None),
+        llm_model: str | None = Form(None),
+        llm_api_key: str | None = Form(None),
     ) -> dict[str, str]:
         suffix = Path(file.filename or "").suffix.lower()
         if suffix not in SUPPORTED_UPLOAD_EXTENSIONS:
@@ -42,7 +47,18 @@ def create_app(data_root: Path | None = None) -> FastAPI:
         storage.create_job(job)
         content = await file.read()
         source_path = storage.save_upload(job.job_id, file.filename or "upload", content)
-        background_tasks.add_task(_process_job, storage, job.job_id, source_path)
+        background_tasks.add_task(
+            _process_job,
+            storage,
+            job.job_id,
+            source_path,
+            LlmRequestConfig(
+                enabled=llm_enabled,
+                base_url=llm_base_url,
+                model=llm_model,
+                api_key=llm_api_key,
+            ),
+        )
         return {"job_id": job.job_id, "status": job.status.value}
 
     @app.get("/api/jobs/{job_id}")
@@ -80,7 +96,12 @@ def _safe_source_type(suffix: str) -> SourceType | None:
         return None
 
 
-def _process_job(storage: FileStorage, job_id: str, source_path: Path) -> None:
+def _process_job(
+    storage: FileStorage,
+    job_id: str,
+    source_path: Path,
+    llm_config: LlmRequestConfig | None = None,
+) -> None:
     job = storage.load_job(job_id)
     job.status = JobStatus.PROCESSING
     job.message = "正在解析户型并生成 3D 场景。"
@@ -89,9 +110,19 @@ def _process_job(storage: FileStorage, job_id: str, source_path: Path) -> None:
 
     try:
         floorplan = parse_floorplan(source_path)
-        storage.save_floorplan(job_id, floorplan)
         scene_id = f"scene_{job_id}"
-        scene = build_scene_spec(scene_id, floorplan)
+        furniture_hints: dict[str, str] = {}
+        if llm_config and llm_config.enabled:
+            draft_scene = build_scene_spec(scene_id, floorplan)
+            floorplan, furniture_hints = apply_scene_llm_enhancements(
+                source_path,
+                floorplan,
+                draft_scene,
+                llm_config,
+            )
+
+        storage.save_floorplan(job_id, floorplan)
+        scene = build_scene_spec(scene_id, floorplan, furniture_hints=furniture_hints)
         glb_bytes = export_scene_glb(scene)
         storage.save_scene(scene)
         storage.save_model(scene_id, glb_bytes)
@@ -101,7 +132,7 @@ def _process_job(storage: FileStorage, job_id: str, source_path: Path) -> None:
         job.updated_at = utc_now_iso()
         job.scene_id = scene_id
         job.confidence = floorplan.confidence
-        job.warnings = floorplan.warnings
+        job.warnings = scene.warnings
         job.scene_url = f"/api/scenes/{scene_id}"
         job.model_url = f"/api/scenes/{scene_id}/model.glb"
         storage.save_job(job)
