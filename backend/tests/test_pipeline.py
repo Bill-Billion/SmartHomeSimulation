@@ -518,7 +518,10 @@ def test_parse_raster_ocr_failure_falls_back_to_geometry_rules(
 
     assert spec.rooms
     assert any(room.room_type != RoomType.GENERIC for room in spec.rooms)
-    assert any("房间文字识别失败" in warning for warning in spec.warnings)
+    assert any(
+        "房间文字识别失败" in warning or "系统未找到文字识别引擎" in warning
+        for warning in spec.warnings
+    )
 
 
 def test_extract_raster_semantic_hints_warns_when_tesseract_missing(

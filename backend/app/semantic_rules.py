@@ -130,16 +130,29 @@ def _apply_room_semantics(
         final_scores_by_room[room.room_id] = scores
 
     _apply_room_type_capacity_penalties(final_scores_by_room, hint_assignments)
+    has_text_evidence = any(hint_assignments.values())
+    no_text_assignments = (
+        _resolve_no_text_global_assignments(profiles, final_scores_by_room)
+        if not has_text_evidence
+        else {}
+    )
 
     semantic_warnings: list[str] = []
     has_generic_fallback = False
     updated_rooms: list[RoomSpec] = []
 
     for index, room in enumerate(rooms, start=1):
-        room_type, confidence, degraded = _resolve_room_semantic_choice(
-            final_scores_by_room[room.room_id],
-            hint_assignments.get(room.room_id, []),
-        )
+        if no_text_assignments:
+            room_type = no_text_assignments[room.room_id]
+            confidence, degraded = _resolve_no_text_confidence(
+                room_type,
+                final_scores_by_room[room.room_id],
+            )
+        else:
+            room_type, confidence, degraded = _resolve_room_semantic_choice(
+                final_scores_by_room[room.room_id],
+                hint_assignments.get(room.room_id, []),
+            )
         if degraded:
             has_generic_fallback = True
 
@@ -318,7 +331,7 @@ def _base_room_semantic_scores(
         RoomType.BATHROOM: 0.0,
         RoomType.CORRIDOR: 0.0,
     }
-    corridor_like = profile.aspect > 2.4 or profile.aspect < 0.42 or profile.compactness < 0.62
+    corridor_like = _is_corridor_like(profile)
     adjacency_count = len(profile.neighbors)
 
     if profile.area_rank == 0:
@@ -425,6 +438,255 @@ def _resolve_room_semantic_choice(
         _semantic_confidence(best_score, gap, has_text_evidence, bool(direct_text_types), False),
         False,
     )
+
+
+def _resolve_no_text_global_assignments(
+    profiles: dict[str, RoomSemanticProfile],
+    scores_by_room: dict[str, dict[RoomType, float]],
+) -> dict[str, RoomType]:
+    """无文本模式下做户型级角色分配，避免每个房间各自打分后集体退化。"""
+    assignments: dict[str, RoomType] = {room_id: RoomType.GENERIC for room_id in profiles}
+    remaining = set(profiles.keys())
+    centrality = _layout_centrality_scores(profiles)
+
+    # 先锁定走廊，避免后续把细长连通空间误分给厨房或卧室。
+    corridor_id = _pick_best_room(
+        remaining,
+        lambda room_id: _no_text_corridor_rank(
+            profiles[room_id],
+            scores_by_room[room_id],
+            centrality[room_id],
+        ),
+        threshold=3.2,
+    )
+    if corridor_id is not None:
+        assignments[corridor_id] = RoomType.CORRIDOR
+        remaining.remove(corridor_id)
+
+    # 客厅按中心性、面积和连接度优先，不允许细长空间抢占。
+    living_id = _pick_best_room(
+        remaining,
+        lambda room_id: _no_text_living_rank(
+            profiles[room_id],
+            scores_by_room[room_id],
+            centrality[room_id],
+        ),
+        threshold=2.9,
+    )
+    if living_id is None and remaining:
+        living_id = max(
+            remaining,
+            key=lambda room_id: scores_by_room[room_id][RoomType.LIVING_ROOM],
+        )
+    if living_id is not None:
+        assignments[living_id] = RoomType.LIVING_ROOM
+        remaining.remove(living_id)
+
+    # 厨房只分配一个，优先靠外墙且与客厅/走廊相邻的中小空间。
+    kitchen_id = _pick_best_room(
+        remaining,
+        lambda room_id: _no_text_kitchen_rank(
+            profiles[room_id],
+            scores_by_room[room_id],
+            assignments,
+        ),
+        threshold=2.5,
+    )
+    if kitchen_id is not None:
+        assignments[kitchen_id] = RoomType.KITCHEN
+        remaining.remove(kitchen_id)
+
+    # 卫生间最多两个；小面积、低外墙暴露且靠近连接空间的候选优先。
+    bathroom_capacity = 2 if len(profiles) >= 5 else 1
+    bathroom_candidates = sorted(
+        remaining,
+        key=lambda room_id: _no_text_bathroom_rank(
+            profiles[room_id],
+            scores_by_room[room_id],
+            assignments,
+            centrality[room_id],
+        ),
+        reverse=True,
+    )
+    assigned_bathrooms = 0
+    for room_id in bathroom_candidates:
+        if assigned_bathrooms >= bathroom_capacity:
+            break
+        rank = _no_text_bathroom_rank(
+            profiles[room_id],
+            scores_by_room[room_id],
+            assignments,
+            centrality[room_id],
+        )
+        if rank < 2.4:
+            continue
+        assignments[room_id] = RoomType.BATHROOM
+        remaining.remove(room_id)
+        assigned_bathrooms += 1
+
+    # 剩余房间优先回收为卧室，只有证据确实不足时才保留 generic。
+    for room_id in sorted(remaining):
+        profile = profiles[room_id]
+        score = scores_by_room[room_id]
+        bedroom_rank = _no_text_bedroom_rank(profile, score)
+        if bedroom_rank >= 2.1 or (
+            profile.area_ratio >= 0.08
+            and not _is_corridor_like(profile)
+            and len(profile.neighbors) <= 3
+        ):
+            assignments[room_id] = RoomType.BEDROOM
+        else:
+            assignments[room_id] = RoomType.GENERIC
+    return assignments
+
+
+def _pick_best_room(
+    room_ids: set[str],
+    rank_fn,
+    *,
+    threshold: float,
+) -> str | None:
+    if not room_ids:
+        return None
+    ranked = sorted(((room_id, rank_fn(room_id)) for room_id in room_ids), key=lambda item: item[1], reverse=True)
+    room_id, score = ranked[0]
+    if score < threshold:
+        return None
+    return room_id
+
+
+def _layout_centrality_scores(profiles: dict[str, RoomSemanticProfile]) -> dict[str, float]:
+    total_area = max(sum(profile.area for profile in profiles.values()), 0.01)
+    center_x = sum(profile.centroid[0] * profile.area for profile in profiles.values()) / total_area
+    center_z = sum(profile.centroid[1] * profile.area for profile in profiles.values()) / total_area
+    distances = {
+        room_id: math.dist(profile.centroid, (center_x, center_z))
+        for room_id, profile in profiles.items()
+    }
+    max_distance = max(max(distances.values(), default=0.0), 0.01)
+    return {
+        room_id: 1.0 - min(distance / max_distance, 1.0)
+        for room_id, distance in distances.items()
+    }
+
+
+def _no_text_corridor_rank(
+    profile: RoomSemanticProfile,
+    score: dict[RoomType, float],
+    centrality: float,
+) -> float:
+    if profile.area_ratio > 0.36:
+        return -999.0
+    adjacency = len(profile.neighbors)
+    corridor_like = _is_corridor_like(profile)
+    if not corridor_like and adjacency < 3:
+        return -999.0
+    rank = score[RoomType.CORRIDOR]
+    rank += 0.55 * min(adjacency, 4)
+    rank += 1.2 if corridor_like else -0.6
+    rank += (1.0 - centrality) * 0.4
+    rank -= max(profile.area_ratio - 0.18, 0.0) * 6.0
+    return rank
+
+
+def _no_text_living_rank(
+    profile: RoomSemanticProfile,
+    score: dict[RoomType, float],
+    centrality: float,
+) -> float:
+    rank = score[RoomType.LIVING_ROOM]
+    rank += centrality * 1.8
+    rank += min(len(profile.neighbors), 4) * 0.45
+    rank += profile.area_ratio * 3.0
+    if _is_corridor_like(profile):
+        rank -= 2.0
+    if profile.area_ratio < 0.12:
+        rank -= 1.2
+    return rank
+
+
+def _no_text_kitchen_rank(
+    profile: RoomSemanticProfile,
+    score: dict[RoomType, float],
+    assignments: dict[str, RoomType],
+) -> float:
+    rank = score[RoomType.KITCHEN]
+    if profile.outer_contact:
+        rank += 0.8
+    if 0.06 <= profile.area_ratio <= 0.23:
+        rank += 0.7
+    if profile.area_ratio > 0.28:
+        rank -= 1.4
+    if _is_corridor_like(profile):
+        rank -= 0.8
+
+    neighbor_types = {assignments.get(neighbor_id) for neighbor_id in profile.neighbors}
+    if RoomType.LIVING_ROOM in neighbor_types:
+        rank += 1.1
+    if RoomType.CORRIDOR in neighbor_types:
+        rank += 0.7
+    return rank
+
+
+def _no_text_bathroom_rank(
+    profile: RoomSemanticProfile,
+    score: dict[RoomType, float],
+    assignments: dict[str, RoomType],
+    centrality: float,
+) -> float:
+    rank = score[RoomType.BATHROOM]
+    if profile.area_ratio <= 0.16:
+        rank += 0.9
+    if profile.outer_exposure_ratio <= 0.3:
+        rank += 0.8
+    if profile.area_ratio > 0.24:
+        rank -= 1.4
+    if profile.area_ratio < 0.05:
+        rank -= 0.6
+    rank += (1.0 - centrality) * 0.4
+
+    neighbor_types = {assignments.get(neighbor_id) for neighbor_id in profile.neighbors}
+    if RoomType.CORRIDOR in neighbor_types:
+        rank += 1.0
+    elif RoomType.LIVING_ROOM in neighbor_types:
+        rank += 0.5
+    return rank
+
+
+def _no_text_bedroom_rank(
+    profile: RoomSemanticProfile,
+    score: dict[RoomType, float],
+) -> float:
+    rank = score[RoomType.BEDROOM]
+    if profile.outer_contact:
+        rank += 0.5
+    if 0.08 <= profile.area_ratio <= 0.3:
+        rank += 0.5
+    if len(profile.neighbors) <= 2:
+        rank += 0.4
+    if _is_corridor_like(profile):
+        rank -= 0.9
+    return rank
+
+
+def _resolve_no_text_confidence(
+    room_type: RoomType,
+    scores: dict[RoomType, float],
+) -> tuple[float, bool]:
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    if room_type == RoomType.GENERIC:
+        chosen_score = ranked[0][1] if ranked else 0.0
+        second_score = ranked[1][1] if len(ranked) > 1 else 0.0
+    else:
+        chosen_score = scores[room_type]
+        second_score = max((score for kind, score in ranked if kind != room_type), default=0.0)
+    gap = chosen_score - second_score
+    degraded = room_type == RoomType.GENERIC or chosen_score < 2.1
+    return _semantic_confidence(chosen_score, gap, False, False, degraded), degraded
+
+
+def _is_corridor_like(profile: RoomSemanticProfile) -> bool:
+    return profile.aspect > 2.4 or profile.aspect < 0.42 or profile.compactness < 0.62
 
 
 def _semantic_confidence(
