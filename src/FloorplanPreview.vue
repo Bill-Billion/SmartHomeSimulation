@@ -14,14 +14,24 @@
         fill="#6a707f"
         rx="0.2"
       />
+      <image
+        v-if="sourcePreviewUrl && overlayEnabled"
+        :x="bounds.minX - padding"
+        :y="-(bounds.maxZ + padding)"
+        :width="bounds.width + padding * 2"
+        :height="bounds.height + padding * 2"
+        :href="sourcePreviewUrl"
+        preserveAspectRatio="none"
+        :opacity="overlayOpacity"
+      />
       <g transform="scale(1,-1)">
         <polygon
           v-for="room in sceneSpec.rooms"
           :key="room.room_id"
           :points="polygonPoints(room.polygon)"
-          :fill="roomFill(room.room_type)"
-          stroke="#26282f"
-          :stroke-width="strokeWidth"
+          :fill="roomFill(room)"
+          :stroke="roomStroke(room.room_id)"
+          :stroke-width="roomStrokeWidth(room.room_id)"
           stroke-linejoin="round"
         />
         <line
@@ -69,6 +79,26 @@ const props = defineProps({
   sceneSpec: {
     type: Object,
     default: null
+  },
+  roomLightStates: {
+    type: Object,
+    default: () => ({})
+  },
+  selectedRoomId: {
+    type: String,
+    default: ''
+  },
+  sourcePreviewUrl: {
+    type: String,
+    default: ''
+  },
+  overlayEnabled: {
+    type: Boolean,
+    default: false
+  },
+  overlayOpacity: {
+    type: Number,
+    default: 0.45
   }
 });
 
@@ -116,7 +146,7 @@ const roomLabels = computed(() => {
     const center = roomCenter(room.polygon || []);
     return {
       room_id: room.room_id,
-      title: roomTypeLabel(room.room_type),
+      title: room.name || roomTypeLabel(room.room_type),
       area: `${Number(room.area_sqm || 0).toFixed(1)}m²`,
       center: {
         x: center.x,
@@ -162,7 +192,7 @@ function roomTypeLabel(roomType) {
   return mapping[roomType] || '空间';
 }
 
-function roomFill(roomType) {
+function roomFill(room) {
   const mapping = {
     bedroom: '#e6c98d',
     living_room: '#eee4cf',
@@ -171,7 +201,39 @@ function roomFill(roomType) {
     corridor: '#efe7d6',
     generic: '#e9e5d9'
   };
-  return mapping[roomType] || '#e9e5d9';
+  const baseColor = mapping[room.room_type] || '#e9e5d9';
+  if (props.roomLightStates?.[room.room_id]) {
+    return tintColor(baseColor, 0.22);
+  }
+  return baseColor;
+}
+
+function roomStroke(roomId) {
+  if (props.selectedRoomId && props.selectedRoomId === roomId) {
+    return '#1f8a68';
+  }
+  return '#26282f';
+}
+
+function roomStrokeWidth(roomId) {
+  if (props.selectedRoomId && props.selectedRoomId === roomId) {
+    return strokeWidth * 1.8;
+  }
+  return strokeWidth;
+}
+
+function tintColor(hexColor, ratio) {
+  const hex = hexColor.replace('#', '');
+  const value = Number.parseInt(hex, 16);
+  const red = (value >> 16) & 255;
+  const green = (value >> 8) & 255;
+  const blue = value & 255;
+
+  const nextRed = Math.round(red + (255 - red) * ratio);
+  const nextGreen = Math.round(green + (255 - green) * ratio);
+  const nextBlue = Math.round(blue + (255 - blue) * ratio);
+
+  return `rgb(${nextRed}, ${nextGreen}, ${nextBlue})`;
 }
 </script>
 
@@ -211,4 +273,3 @@ function roomFill(roomType) {
   color: rgba(255, 255, 255, 0.85);
 }
 </style>
-

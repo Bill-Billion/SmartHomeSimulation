@@ -46,6 +46,18 @@ const props = defineProps({
   sceneCamera: {
     type: Object,
     default: null
+  },
+  roomLightStates: {
+    type: Object,
+    default: () => ({})
+  },
+  selectedRoomId: {
+    type: String,
+    default: ''
+  },
+  roomIds: {
+    type: Array,
+    default: () => []
   }
 });
 
@@ -58,7 +70,9 @@ const loadError = ref('');
 const allMeshes = ref([]);
 const modelCenter = ref(new THREE.Vector3(0, 0, 0));
 const modelMaxDim = ref(6);
+const roomBounds = ref(new Map());
 let highlightIndex = -1;
+let activeLoadToken = 0;
 
 function resetHighlight() {
   allMeshes.value.forEach((mesh) => {
@@ -79,8 +93,13 @@ function processModel(scene) {
     child.castShadow = true;
     child.receiveShadow = true;
     if (child.material) {
+      child.material = child.material.clone();
       child.material.side = THREE.DoubleSide;
+      child.userData.baseColor = child.material.color?.clone() || new THREE.Color(0xffffff);
+      child.userData.baseEmissive = child.material.emissive?.clone() || new THREE.Color(0x000000);
+      child.userData.baseEmissiveIntensity = child.material.emissiveIntensity || 0;
     }
+    child.userData.roomId = parseRoomIdFromNodeName(child.name || '');
     meshes.push(child);
   });
   allMeshes.value = meshes;
@@ -90,10 +109,12 @@ function processModel(scene) {
   const size = box.getSize(new THREE.Vector3());
   modelCenter.value = center.clone();
   scene.position.set(-center.x, -center.y, -center.z);
+  roomBounds.value = collectRoomBounds(meshes);
 
   const maxDim = Math.max(size.x, size.y, size.z, 6);
   modelMaxDim.value = maxDim;
   syncCameraState();
+  applyRoomVisualState();
 
   if (controlsRef.value?.instance) {
     controlsRef.value.instance.enableDamping = true;
@@ -101,6 +122,10 @@ function processModel(scene) {
     controlsRef.value.instance.maxDistance = maxDim * 3.2;
     controlsRef.value.instance.maxPolarAngle = Math.PI / 2.2;
     applyCameraState();
+  }
+
+  if (props.selectedRoomId) {
+    focusSelectedRoom();
   }
 }
 
@@ -146,6 +171,8 @@ function resetView() {
 }
 
 function loadModel(modelUrl) {
+  activeLoadToken += 1;
+  const loadToken = activeLoadToken;
   isLoading.value = true;
   loadError.value = '';
   resetHighlight();
@@ -155,6 +182,9 @@ function loadModel(modelUrl) {
   loader.load(
     modelUrl,
     (gltf) => {
+      if (loadToken !== activeLoadToken) {
+        return;
+      }
       const scene = gltf.scene || gltf.scenes?.[0];
       if (!scene) {
         loadError.value = '模型已返回，但内容为空。';
@@ -167,6 +197,9 @@ function loadModel(modelUrl) {
     },
     undefined,
     (error) => {
+      if (loadToken !== activeLoadToken) {
+        return;
+      }
       console.error('模型加载失败', error);
       loadError.value = '模型加载失败，请检查后端服务是否已经启动。';
       isLoading.value = false;
@@ -193,6 +226,105 @@ function highlightNextComponent() {
   current.material.color.set(0x5f9f7f);
 }
 
+function parseRoomIdFromNodeName(name) {
+  if (!name) {
+    return '';
+  }
+  if (name.startsWith('floor_')) {
+    return name.slice('floor_'.length);
+  }
+  if (name.startsWith('ceiling_')) {
+    return name.slice('ceiling_'.length);
+  }
+  if (name.startsWith('furniture_')) {
+    const suffix = name.slice('furniture_'.length);
+    const orderedRoomIds = [...props.roomIds].sort((left, right) => right.length - left.length);
+    for (const roomId of orderedRoomIds) {
+      if (suffix.startsWith(`${roomId}_`)) {
+        return roomId;
+      }
+    }
+  }
+  return '';
+}
+
+function collectRoomBounds(meshes) {
+  const nextBounds = new Map();
+  meshes.forEach((mesh) => {
+    const roomId = mesh.userData.roomId;
+    if (!roomId) {
+      return;
+    }
+    const meshBox = new THREE.Box3().setFromObject(mesh);
+    const existing = nextBounds.get(roomId);
+    if (!existing) {
+      nextBounds.set(roomId, meshBox.clone());
+      return;
+    }
+    existing.union(meshBox);
+  });
+  return nextBounds;
+}
+
+function applyRoomVisualState() {
+  allMeshes.value.forEach((mesh) => {
+    if (!mesh.material || !mesh.userData.baseColor) {
+      return;
+    }
+    if (mesh.userData.originalMaterial) {
+      return;
+    }
+
+    mesh.material.color.copy(mesh.userData.baseColor);
+    if (mesh.material.emissive && mesh.userData.baseEmissive) {
+      mesh.material.emissive.copy(mesh.userData.baseEmissive);
+      mesh.material.emissiveIntensity = mesh.userData.baseEmissiveIntensity || 0;
+    }
+
+    const roomId = mesh.userData.roomId;
+    if (!roomId) {
+      return;
+    }
+
+    const isOn = Boolean(props.roomLightStates?.[roomId]);
+    const isSelected = props.selectedRoomId && props.selectedRoomId === roomId;
+    if (isOn) {
+      mesh.material.color.lerp(new THREE.Color(0xffffff), 0.1);
+      if (mesh.material.emissive) {
+        mesh.material.emissive.set(0x2a281f);
+        mesh.material.emissiveIntensity = isSelected ? 0.34 : 0.2;
+      }
+      return;
+    }
+
+    mesh.material.color.multiplyScalar(isSelected ? 0.92 : 0.8);
+    if (isSelected) {
+      mesh.material.color.lerp(new THREE.Color(0x5f9f7f), 0.18);
+    }
+  });
+}
+
+function focusSelectedRoom() {
+  const roomId = props.selectedRoomId;
+  if (!roomId) {
+    return;
+  }
+  const box = roomBounds.value.get(roomId);
+  if (!box) {
+    return;
+  }
+  const center = box.getCenter(new THREE.Vector3());
+  const size = box.getSize(new THREE.Vector3());
+  const horizontal = Math.max(size.x, size.z, 2.6);
+  cameraTarget.value = [center.x, Math.max(center.y, 0), center.z];
+  cameraPosition.value = [
+    center.x + horizontal * 0.92,
+    Math.max(horizontal * 1.15, 2.8),
+    center.z + horizontal * 0.92
+  ];
+  applyCameraState();
+}
+
 watch(
   () => props.modelUrl,
   (nextUrl) => {
@@ -210,6 +342,22 @@ watch(
       syncCameraState();
       resetView();
     }
+  }
+);
+
+watch(
+  () => props.roomLightStates,
+  () => {
+    applyRoomVisualState();
+  },
+  { deep: true }
+);
+
+watch(
+  () => props.selectedRoomId,
+  () => {
+    applyRoomVisualState();
+    focusSelectedRoom();
   }
 );
 </script>

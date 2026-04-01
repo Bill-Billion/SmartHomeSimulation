@@ -9,6 +9,8 @@
 
 这一版把两个最影响观感的问题一起补强了。栅格主链现在会先判断图片更像线稿还是彩色装修图；命中装修图时，会走 `parser_raster_decorated.py`，先做主平面 ROI 裁剪，再并行评估原始 ROI 和纹理压平 ROI 的房间候选，最后按质量评分选出更可信的多房间结构。AI 实验增强这边也不再把所有失败吞成一句 warning，而是能区分配置缺失、连接失败、超时、鉴权失败、接口路径不兼容、图片输入不支持、返回内容非 JSON 和 schema 不合法这些场景。
 
+阶段 2 当前已落地最小仿真运行时。后端支持从 `SceneSpec` 创建仿真会话，按自然语言命令驱动单域照明智能体执行动作，并回写 `WorldState` 和事件流，形成可回放的最小闭环。
+
 ## 当前能力
 
 - 支持上传平面图或 DXF
@@ -21,6 +23,9 @@
 - 支持按相机方向做 cutaway 预览，并优先沿可用墙面摆放家具
 - 支持可选 AI 辅助理解；AI 只补语义和家具建议，不改墙体几何，也不会把密钥写入产物文件
 - 支持把 AI 失败原因明确回传成自然语言 warning，便于判断是超时、鉴权、接口不兼容还是返回格式错误
+- 支持最小仿真运行时：会话创建、灯光命令执行、状态快照查询和事件流分页读取
+- 支持同页仿真控制面板：创建会话、下发灯光命令、查看设备状态和事件流，并同步到 2D/3D 视图反馈
+- 支持默认折叠的分析面板：查看 diagnostics、源图预览、房间证据和 AI 失败原因
 
 ## 项目结构
 
@@ -55,12 +60,37 @@ npm run dev
 
 ## 接口概览
 
+主生成链：
+
 - `POST /api/floorplans:generate`
   - multipart 必填字段：`file`
   - multipart 可选字段：`llm_enabled`、`llm_base_url`、`llm_model`、`llm_api_key`
 - `GET /api/jobs/{job_id}`
 - `GET /api/scenes/{scene_id}`
 - `GET /api/scenes/{scene_id}/model.glb`
+
+仿真链：
+
+- `POST /api/simulations:sessions`
+- `GET /api/simulations/sessions/{session_id}`
+- `POST /api/simulations/sessions/{session_id}/commands`
+- `GET /api/simulations/sessions/{session_id}/events`
+
+解释层只读接口：
+
+- `GET /api/jobs/{job_id}/diagnostics`
+- `GET /api/jobs/{job_id}/source-preview.png`
+
+## 质量门禁
+
+后端质量命令：
+
+```bash
+npm run lint:backend
+npm run test:backend
+```
+
+CI 已启用最小门禁：后端 `ruff + pytest`，前端 `npm run build`。
 
 ## 说明
 
