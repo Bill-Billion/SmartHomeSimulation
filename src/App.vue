@@ -10,6 +10,20 @@
       />
       <JobStatusCard :job-state="jobState" />
       <SceneSummaryCard :scene-spec="sceneSpec" />
+      <SimulationControlPanel
+        :api-base="apiBase"
+        :scene-spec="sceneSpec"
+        :selected-room-id="selectedRoomId"
+        @state-change="handleSimulationStateChange"
+        @room-select="handleRoomSelect"
+      />
+      <DiagnosticsPanel
+        :diagnostics="diagnosticsRecord"
+        :source-preview-url="sourcePreviewUrl"
+        :selected-room-id="selectedRoomId"
+        @overlay-change="handleOverlayChange"
+        @room-select="handleRoomSelect"
+      />
     </aside>
 
     <main class="scene-stage">
@@ -36,21 +50,31 @@
       <FloorplanPreview
         v-if="activeView === 'plan'"
         :scene-spec="sceneSpec"
+        :room-light-states="roomLightStates"
+        :selected-room-id="selectedRoomId"
+        :source-preview-url="sourcePreviewUrl"
+        :overlay-enabled="planOverlay.enabled"
+        :overlay-opacity="planOverlay.opacity"
       />
       <ThreeScene
         v-else
         :model-url="modelUrl"
         :scene-label="sceneSpec?.scene_id || '默认示例场景'"
         :scene-camera="sceneSpec?.camera || null"
+        :room-light-states="roomLightStates"
+        :selected-room-id="selectedRoomId"
+        :room-ids="sceneRoomIds"
       />
     </main>
   </div>
 </template>
 
 <script setup>
-import { onBeforeUnmount, reactive, ref } from 'vue';
+import { computed, onBeforeUnmount, reactive, ref } from 'vue';
 import JobStatusCard from './components/JobStatusCard.vue';
 import SceneSummaryCard from './components/SceneSummaryCard.vue';
+import SimulationControlPanel from './components/SimulationControlPanel.vue';
+import DiagnosticsPanel from './components/DiagnosticsPanel.vue';
 import UploadPanel from './components/UploadPanel.vue';
 import FloorplanPreview from './FloorplanPreview.vue';
 import ThreeScene from './ThreeScene.vue';
@@ -63,6 +87,10 @@ const sceneSpec = ref(null);
 const modelUrl = ref('/models/scene.glb');
 const activeView = ref('model');
 const activeRequestKey = ref(0);
+const simulationSession = ref(null);
+const selectedRoomId = ref('');
+const diagnosticsRecord = ref(null);
+const sourcePreviewUrl = ref('');
 const llmOptions = reactive({
   enabled: false,
   baseUrl: 'https://api.openai.com/v1',
@@ -72,6 +100,27 @@ const llmOptions = reactive({
 let pollTimer = null;
 let pollController = null;
 let sceneController = null;
+let diagnosticsController = null;
+const planOverlay = reactive({
+  enabled: false,
+  opacity: 0.45
+});
+
+const roomLightStates = computed(() => {
+  const devices = simulationSession.value?.world_state?.devices || [];
+  const stateMap = {};
+  devices.forEach((device) => {
+    if (device.room_id) {
+      stateMap[device.room_id] = Boolean(device.is_on);
+    }
+  });
+  return stateMap;
+});
+
+const sceneRoomIds = computed(() => {
+  const rooms = sceneSpec.value?.rooms || [];
+  return rooms.map((room) => room.room_id);
+});
 
 function buildApiPath(path) {
   return `${apiBase}${path}`;
@@ -98,6 +147,10 @@ function abortInFlightRequests() {
     sceneController.abort();
     sceneController = null;
   }
+  if (diagnosticsController) {
+    diagnosticsController.abort();
+    diagnosticsController = null;
+  }
 }
 
 async function submitUpload() {
@@ -110,6 +163,12 @@ async function submitUpload() {
   stopPolling();
   abortInFlightRequests();
   sceneSpec.value = null;
+  simulationSession.value = null;
+  diagnosticsRecord.value = null;
+  sourcePreviewUrl.value = '';
+  selectedRoomId.value = '';
+  planOverlay.enabled = false;
+  planOverlay.opacity = 0.45;
   activeView.value = 'model';
   isSubmitting.value = true;
   jobState.value = {
@@ -161,6 +220,22 @@ async function submitUpload() {
   }
 }
 
+function handleSimulationStateChange(payload) {
+  simulationSession.value = payload?.session || null;
+}
+
+function handleRoomSelect(roomId) {
+  selectedRoomId.value = roomId || '';
+}
+
+function handleOverlayChange(payload) {
+  planOverlay.enabled = Boolean(payload?.enabled);
+  const nextOpacity = Number(payload?.opacity ?? 0.45);
+  planOverlay.opacity = Number.isFinite(nextOpacity)
+    ? Math.min(Math.max(nextOpacity, 0.1), 0.9)
+    : 0.45;
+}
+
 async function pollJob(jobId, requestKey) {
   if (requestKey !== activeRequestKey.value) {
     return;
@@ -186,6 +261,7 @@ async function pollJob(jobId, requestKey) {
     if (payload.status === 'completed' && payload.scene_url && payload.model_url) {
       modelUrl.value = `${buildApiPath(payload.model_url)}?t=${Date.now()}`;
       await loadScene(payload.scene_url, requestKey);
+      await loadDiagnostics(payload.job_id, requestKey);
       if (requestKey !== activeRequestKey.value) {
         return;
       }
@@ -242,6 +318,41 @@ async function loadScene(sceneUrl, requestKey) {
   } finally {
     if (sceneController === controller) {
       sceneController = null;
+    }
+  }
+}
+
+async function loadDiagnostics(jobId, requestKey) {
+  if (requestKey !== activeRequestKey.value) {
+    return;
+  }
+  const controller = new AbortController();
+  diagnosticsController?.abort();
+  diagnosticsController = controller;
+  try {
+    const response = await fetch(buildApiPath(`/api/jobs/${jobId}/diagnostics`), {
+      signal: controller.signal
+    });
+    const payload = await response.json().catch(() => null);
+    if (requestKey !== activeRequestKey.value) {
+      return;
+    }
+    if (!response.ok) {
+      diagnosticsRecord.value = null;
+      sourcePreviewUrl.value = '';
+      return;
+    }
+    diagnosticsRecord.value = payload;
+    sourcePreviewUrl.value = `${buildApiPath(`/api/jobs/${jobId}/source-preview.png`)}?t=${Date.now()}`;
+  } catch (error) {
+    if (error?.name === 'AbortError' || requestKey !== activeRequestKey.value) {
+      return;
+    }
+    diagnosticsRecord.value = null;
+    sourcePreviewUrl.value = '';
+  } finally {
+    if (diagnosticsController === controller) {
+      diagnosticsController = null;
     }
   }
 }

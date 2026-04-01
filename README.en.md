@@ -9,6 +9,8 @@ This prototype turns uploaded floor plan images or DXF files into a browsable 2D
 
 This release improves the two weakest spots in the current user flow. The raster parser now routes colorful decorated plans into `parser_raster_decorated.py`, crops the main plan ROI, evaluates both raw and texture-flattened variants, and scores the recovered room sets so furniture, floor textures, and dimension lines are less likely to collapse the result into one giant shell. The optional AI enhancement path also returns diagnosable warnings instead of a single generic fallback message, so timeouts, auth failures, incompatible endpoints, image-input rejection, invalid JSON, and schema violations are easier to understand.
 
+Phase 2 now includes a minimal simulation runtime. The backend can create a simulation session from `SceneSpec`, execute single-domain lighting commands, and persist both `WorldState` snapshots and ordered event logs.
+
 ## Current Scope
 
 - Upload `JPG`, `PNG`, `PDF`, and `DXF`
@@ -21,6 +23,9 @@ This release improves the two weakest spots in the current user flow. The raster
 - Preview the generated layout in both 2D plan mode and cutaway 3D mode
 - Optionally use an OpenAI-compatible model for semantic and furniture-placement refinement without changing wall geometry
 - Surface more specific AI fallback warnings when the remote service times out, rejects auth, rejects image input, or returns invalid structured output
+- Run a minimal simulation loop with session creation, lighting commands, state snapshots, and paged event streams
+- Use an in-page simulation panel to create sessions, send lighting commands, inspect device states and events, and reflect room-level state in both 2D and 3D views
+- Use a collapsed diagnostics panel to inspect source preview, room-level evidence, and AI fallback reasons
 
 ## Structure
 
@@ -53,12 +58,37 @@ npm run dev
 
 ## API
 
+Generation APIs:
+
 - `POST /api/floorplans:generate`
   - required multipart field: `file`
   - optional multipart fields: `llm_enabled`, `llm_base_url`, `llm_model`, `llm_api_key`
 - `GET /api/jobs/{job_id}`
 - `GET /api/scenes/{scene_id}`
 - `GET /api/scenes/{scene_id}/model.glb`
+
+Simulation APIs:
+
+- `POST /api/simulations:sessions`
+- `GET /api/simulations/sessions/{session_id}`
+- `POST /api/simulations/sessions/{session_id}/commands`
+- `GET /api/simulations/sessions/{session_id}/events`
+
+Diagnostics read-only APIs:
+
+- `GET /api/jobs/{job_id}/diagnostics`
+- `GET /api/jobs/{job_id}/source-preview.png`
+
+## Quality Gates
+
+Backend quality commands:
+
+```bash
+npm run lint:backend
+npm run test:backend
+```
+
+CI runs backend `ruff + pytest` and frontend `npm run build`.
 
 ## Notes
 

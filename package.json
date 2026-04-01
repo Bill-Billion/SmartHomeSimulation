@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "dev:backend": "python3 -m uvicorn backend.app.main:app --reload --app-dir .",
+    "dev:backend": ".venv/bin/python -m uvicorn backend.app.main:app --reload --app-dir .",
+    "lint:backend": ".venv/bin/python -m ruff check backend",
+    "test:backend": ".venv/bin/python -m pytest backend/tests -q",
     "build": "vite build",
     "preview": "vite preview"
   },

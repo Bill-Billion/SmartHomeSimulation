@@ -2,20 +2,32 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
 from .config import SUPPORTED_UPLOAD_EXTENSIONS
+from .diagnostics import build_diagnostics_record, build_source_preview_png
 from .llm_enhancer import LlmRequestConfig, apply_scene_llm_enhancements
-from .models import JobRecord, JobStatus, SourceType, utc_now_iso
+from .models import (
+    CreateSimulationSessionRequest,
+    DiagnosticsRecord,
+    JobRecord,
+    JobStatus,
+    SimulationCommandRequest,
+    SimulationEventsPage,
+    SourceType,
+    utc_now_iso,
+)
 from .parsers import UnsupportedFormatError, parse_floorplan
 from .scene_builder import build_scene_spec, export_scene_glb
+from .simulation_runtime import SimulationRuntime
 from .storage import FileStorage
 
 
 def create_app(data_root: Path | None = None) -> FastAPI:
     storage = FileStorage(data_root)
+    simulation_runtime = SimulationRuntime(storage)
     app = FastAPI(
         title="Smart Home Floorplan Generator",
         description="上传 CAD 或平面图并生成可预览 3D 场景。",
@@ -43,7 +55,12 @@ def create_app(data_root: Path | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="仅支持 JPG、PNG、PDF、DXF、DWG 文件。")
 
         source_type = _safe_source_type(suffix)
-        job = JobRecord.new(source_filename=file.filename or "upload", source_type=source_type)
+        job = JobRecord.new(
+            source_filename=file.filename or "upload",
+            source_type=source_type,
+            llm_enabled=llm_enabled,
+            llm_model=llm_model,
+        )
         storage.create_job(job)
         content = await file.read()
         source_path = storage.save_upload(job.job_id, file.filename or "upload", content)
@@ -68,6 +85,57 @@ def create_app(data_root: Path | None = None) -> FastAPI:
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="未找到对应任务。") from exc
 
+    @app.get("/api/jobs/{job_id}/diagnostics")
+    def get_job_diagnostics(job_id: str) -> DiagnosticsRecord:
+        try:
+            job = storage.load_job(job_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="未找到对应任务。") from exc
+
+        try:
+            return storage.load_diagnostics(job_id)
+        except FileNotFoundError:
+            pass
+
+        if job.status != JobStatus.COMPLETED:
+            raise HTTPException(status_code=409, detail="任务尚未完成，暂时无法查看诊断数据。")
+        if not job.scene_id:
+            raise HTTPException(status_code=409, detail="任务缺少场景信息，暂时无法查看诊断数据。")
+
+        try:
+            floorplan = storage.load_floorplan(job_id)
+            scene = storage.load_scene(job.scene_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="诊断所需产物不存在。") from exc
+
+        record = build_diagnostics_record(
+            job=job,
+            floorplan=floorplan,
+            scene=scene,
+            llm_enabled=job.llm_enabled,
+            llm_model=job.llm_model,
+        )
+        storage.save_diagnostics(job_id, record)
+        return record
+
+    @app.get("/api/jobs/{job_id}/source-preview.png")
+    def get_job_source_preview(job_id: str):
+        try:
+            job = storage.load_job(job_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="未找到对应任务。") from exc
+
+        try:
+            source_path = storage.source_path(job_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="任务源文件不存在。") from exc
+
+        try:
+            image_bytes = build_source_preview_png(source_path, job.source_type)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return Response(content=image_bytes, media_type="image/png")
+
     @app.get("/api/scenes/{scene_id}")
     def get_scene(scene_id: str):
         try:
@@ -85,6 +153,48 @@ def create_app(data_root: Path | None = None) -> FastAPI:
     @app.get("/api/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.post("/api/simulations:sessions")
+    def create_simulation_session(request: CreateSimulationSessionRequest):
+        try:
+            return simulation_runtime.create_session(request=request)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="未找到对应场景，无法创建仿真会话。") from exc
+
+    @app.get("/api/simulations/sessions/{session_id}")
+    def get_simulation_session(session_id: str):
+        try:
+            return simulation_runtime.get_session(session_id=session_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="未找到对应仿真会话。") from exc
+
+    @app.post("/api/simulations/sessions/{session_id}/commands")
+    def execute_simulation_command(session_id: str, request: SimulationCommandRequest):
+        try:
+            session, execution = simulation_runtime.execute_command(
+                session_id=session_id,
+                request=request,
+            )
+            return {"session": session, "execution": execution}
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="未找到对应仿真会话。") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/simulations/sessions/{session_id}/events")
+    def get_simulation_events(
+        session_id: str,
+        cursor: int = Query(default=0, ge=0),
+        limit: int = Query(default=50, ge=1, le=200),
+    ) -> SimulationEventsPage:
+        try:
+            simulation_runtime.get_session(session_id=session_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="未找到对应仿真会话。") from exc
+        try:
+            return simulation_runtime.read_events(session_id=session_id, cursor=cursor, limit=limit)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return app
 
@@ -131,10 +241,25 @@ def _process_job(
         job.message = "场景生成完成，可以开始预览。"
         job.updated_at = utc_now_iso()
         job.scene_id = scene_id
+        job.llm_enabled = bool(llm_config and llm_config.enabled)
+        job.llm_model = llm_config.model if llm_config else None
         job.confidence = floorplan.confidence
         job.warnings = scene.warnings
         job.scene_url = f"/api/scenes/{scene_id}"
         job.model_url = f"/api/scenes/{scene_id}/model.glb"
+
+        try:
+            diagnostics_record = build_diagnostics_record(
+                job=job,
+                floorplan=floorplan,
+                scene=scene,
+                llm_enabled=job.llm_enabled,
+                llm_model=job.llm_model,
+            )
+            storage.save_diagnostics(job_id, diagnostics_record)
+        except Exception:  # noqa: BLE001
+            job.warnings = [*job.warnings, "诊断信息生成失败，已跳过但不影响主预览流程。"]
+
         storage.save_job(job)
     except UnsupportedFormatError as exc:
         job.status = JobStatus.FAILED
