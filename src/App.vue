@@ -1,63 +1,15 @@
 <template>
   <div class="app-shell">
     <aside class="side-panel">
-      <section class="panel-card">
-        <p class="eyebrow">第一阶段</p>
-        <h1>上传 CAD 或平面图，直接生成 3D 场景</h1>
-        <p class="panel-text">
-          支持 JPG、PNG、PDF、DXF。DWG 会收到转换提示。当前阶段走规则生成，重点是让上传、生成和预览链路稳定可用。
-        </p>
-
-        <form class="upload-form" @submit.prevent="submitUpload">
-          <label class="file-picker">
-            <span>{{ selectedFile ? selectedFile.name : '选择户型文件' }}</span>
-            <input
-              type="file"
-              accept=".jpg,.jpeg,.png,.pdf,.dxf,.dwg"
-              @change="handleFileChange"
-            >
-          </label>
-          <button type="submit" :disabled="isSubmitting || !selectedFile">
-            {{ isSubmitting ? '正在提交' : '开始生成' }}
-          </button>
-        </form>
-
-        <p class="hint-text">
-          推荐优先使用线条清晰的 JPG、PNG、PDF 或 DXF。若上传 DWG，后端会提示先转换格式。
-        </p>
-      </section>
-
-      <section class="panel-card" v-if="jobState">
-        <div class="status-row">
-          <span class="status-label">任务状态</span>
-          <strong :class="['status-chip', `status-${jobState.status}`]">
-            {{ statusText(jobState.status) }}
-          </strong>
-        </div>
-        <p class="panel-text">{{ jobState.message }}</p>
-        <p class="meta-line" v-if="jobState.job_id">任务编号：{{ jobState.job_id }}</p>
-        <p class="meta-line" v-if="jobState.confidence != null">
-          识别置信度：{{ Math.round(jobState.confidence * 100) }}%
-        </p>
-        <p class="error-text" v-if="jobState.error">{{ jobState.error }}</p>
-        <ul class="warning-list" v-if="jobState.warnings?.length">
-          <li v-for="warning in jobState.warnings" :key="warning">{{ warning }}</li>
-        </ul>
-      </section>
-
-      <section class="panel-card" v-if="sceneSpec">
-        <div class="status-row">
-          <span class="status-label">场景摘要</span>
-          <strong>{{ sceneSpec.scene_id }}</strong>
-        </div>
-        <p class="meta-line">房间数量：{{ sceneSpec.rooms.length }}</p>
-        <p class="meta-line">墙体数量：{{ sceneSpec.walls.length }}</p>
-        <p class="meta-line">开口数量：{{ sceneSpec.openings.length }}</p>
-        <p class="meta-line">家具数量：{{ sceneSpec.furnitures.length }}</p>
-        <p class="meta-line">
-          场景尺寸：{{ sceneSpec.bounds_width_m.toFixed(1) }}m × {{ sceneSpec.bounds_depth_m.toFixed(1) }}m
-        </p>
-      </section>
+      <UploadPanel
+        :selected-file-name="selectedFile?.name || ''"
+        :is-submitting="isSubmitting"
+        :llm-options="llmOptions"
+        @file-change="handleFileChange"
+        @submit="submitUpload"
+      />
+      <JobStatusCard :job-state="jobState" />
+      <SceneSummaryCard :scene-spec="sceneSpec" />
     </aside>
 
     <main class="scene-stage">
@@ -89,13 +41,17 @@
         v-else
         :model-url="modelUrl"
         :scene-label="sceneSpec?.scene_id || '默认示例场景'"
+        :scene-camera="sceneSpec?.camera || null"
       />
     </main>
   </div>
 </template>
 
 <script setup>
-import { onBeforeUnmount, ref } from 'vue';
+import { onBeforeUnmount, reactive, ref } from 'vue';
+import JobStatusCard from './components/JobStatusCard.vue';
+import SceneSummaryCard from './components/SceneSummaryCard.vue';
+import UploadPanel from './components/UploadPanel.vue';
 import FloorplanPreview from './FloorplanPreview.vue';
 import ThreeScene from './ThreeScene.vue';
 
@@ -106,7 +62,16 @@ const jobState = ref(null);
 const sceneSpec = ref(null);
 const modelUrl = ref('/models/scene.glb');
 const activeView = ref('model');
+const activeRequestKey = ref(0);
+const llmOptions = reactive({
+  enabled: false,
+  baseUrl: 'https://api.openai.com/v1',
+  model: '',
+  apiKey: ''
+});
 let pollTimer = null;
+let pollController = null;
+let sceneController = null;
 
 function buildApiPath(path) {
   return `${apiBase}${path}`;
@@ -117,20 +82,21 @@ function handleFileChange(event) {
   selectedFile.value = file || null;
 }
 
-function statusText(status) {
-  const mapping = {
-    pending: '等待处理',
-    processing: '处理中',
-    completed: '已完成',
-    failed: '失败'
-  };
-  return mapping[status] || status;
-}
-
 function stopPolling() {
   if (pollTimer) {
     window.clearTimeout(pollTimer);
     pollTimer = null;
+  }
+}
+
+function abortInFlightRequests() {
+  if (pollController) {
+    pollController.abort();
+    pollController = null;
+  }
+  if (sceneController) {
+    sceneController.abort();
+    sceneController = null;
   }
 }
 
@@ -139,7 +105,10 @@ async function submitUpload() {
     return;
   }
 
+  activeRequestKey.value += 1;
+  const requestKey = activeRequestKey.value;
   stopPolling();
+  abortInFlightRequests();
   sceneSpec.value = null;
   activeView.value = 'model';
   isSubmitting.value = true;
@@ -153,6 +122,12 @@ async function submitUpload() {
 
   const formData = new FormData();
   formData.append('file', selectedFile.value);
+  if (llmOptions.enabled) {
+    formData.append('llm_enabled', 'true');
+    formData.append('llm_base_url', llmOptions.baseUrl);
+    formData.append('llm_model', llmOptions.model);
+    formData.append('llm_api_key', llmOptions.apiKey);
+  }
 
   try {
     const response = await fetch(buildApiPath('/api/floorplans:generate'), {
@@ -170,8 +145,11 @@ async function submitUpload() {
       ...payload,
       message: '文件已提交，正在排队生成场景。'
     };
-    await pollJob(payload.job_id);
+    await pollJob(payload.job_id, requestKey);
   } catch (error) {
+    if (error.name === 'AbortError' || requestKey !== activeRequestKey.value) {
+      return;
+    }
     jobState.value = {
       ...jobState.value,
       status: 'failed',
@@ -183,10 +161,21 @@ async function submitUpload() {
   }
 }
 
-async function pollJob(jobId) {
+async function pollJob(jobId, requestKey) {
+  if (requestKey !== activeRequestKey.value) {
+    return;
+  }
+  const controller = new AbortController();
   try {
-    const response = await fetch(buildApiPath(`/api/jobs/${jobId}`));
+    pollController?.abort();
+    pollController = controller;
+    const response = await fetch(buildApiPath(`/api/jobs/${jobId}`), {
+      signal: controller.signal
+    });
     const payload = await response.json();
+    if (requestKey !== activeRequestKey.value) {
+      return;
+    }
 
     if (!response.ok) {
       throw new Error(payload.detail || '无法读取任务状态。');
@@ -196,7 +185,10 @@ async function pollJob(jobId) {
 
     if (payload.status === 'completed' && payload.scene_url && payload.model_url) {
       modelUrl.value = `${buildApiPath(payload.model_url)}?t=${Date.now()}`;
-      await loadScene(payload.scene_url);
+      await loadScene(payload.scene_url, requestKey);
+      if (requestKey !== activeRequestKey.value) {
+        return;
+      }
       activeView.value = 'plan';
       stopPolling();
       return;
@@ -208,9 +200,12 @@ async function pollJob(jobId) {
     }
 
     pollTimer = window.setTimeout(() => {
-      pollJob(jobId);
+      pollJob(jobId, requestKey);
     }, 1200);
   } catch (error) {
+    if (error.name === 'AbortError' || requestKey !== activeRequestKey.value) {
+      return;
+    }
     jobState.value = {
       ...jobState.value,
       status: 'failed',
@@ -218,22 +213,42 @@ async function pollJob(jobId) {
       error: error.message
     };
     stopPolling();
+  } finally {
+    if (pollController === controller) {
+      pollController = null;
+    }
   }
 }
 
-async function loadScene(sceneUrl) {
-  const response = await fetch(buildApiPath(sceneUrl));
-  const payload = await response.json();
-
-  if (!response.ok) {
-    throw new Error(payload.detail || '场景详情读取失败。');
+async function loadScene(sceneUrl, requestKey) {
+  if (requestKey !== activeRequestKey.value) {
+    return;
   }
+  const controller = new AbortController();
+  sceneController?.abort();
+  sceneController = controller;
+  try {
+    const response = await fetch(buildApiPath(sceneUrl), { signal: controller.signal });
+    const payload = await response.json();
+    if (requestKey !== activeRequestKey.value) {
+      return;
+    }
 
-  sceneSpec.value = payload;
+    if (!response.ok) {
+      throw new Error(payload.detail || '场景详情读取失败。');
+    }
+
+    sceneSpec.value = payload;
+  } finally {
+    if (sceneController === controller) {
+      sceneController = null;
+    }
+  }
 }
 
 onBeforeUnmount(() => {
   stopPolling();
+  abortInFlightRequests();
 });
 </script>
 
@@ -255,123 +270,6 @@ onBeforeUnmount(() => {
   border-right: 1px solid rgba(49, 61, 57, 0.12);
   background: rgba(255, 252, 245, 0.82);
   backdrop-filter: blur(10px);
-}
-
-.panel-card {
-  margin-bottom: 16px;
-  padding: 18px;
-  border-radius: 18px;
-  background: rgba(255, 255, 255, 0.78);
-  box-shadow: 0 14px 28px rgba(49, 61, 57, 0.08);
-}
-
-.eyebrow {
-  margin: 0 0 8px;
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: #6d7f78;
-}
-
-h1 {
-  margin: 0 0 12px;
-  font-size: 28px;
-  line-height: 1.1;
-  color: #22312c;
-}
-
-.panel-text,
-.hint-text,
-.meta-line,
-.error-text {
-  margin: 0 0 10px;
-  line-height: 1.6;
-  color: #42514c;
-}
-
-.upload-form {
-  display: grid;
-  gap: 12px;
-  margin-top: 16px;
-}
-
-.file-picker {
-  display: block;
-  padding: 14px 16px;
-  border: 1px dashed #9aaea7;
-  border-radius: 14px;
-  background: #fbfaf6;
-  color: #314744;
-  cursor: pointer;
-}
-
-.file-picker input {
-  display: none;
-}
-
-button {
-  padding: 12px 14px;
-  border: none;
-  border-radius: 14px;
-  background: #314744;
-  color: #f7f3ea;
-  font-size: 15px;
-  cursor: pointer;
-}
-
-button:disabled {
-  cursor: not-allowed;
-  opacity: 0.56;
-}
-
-.status-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 10px;
-}
-
-.status-label {
-  color: #61726c;
-  font-size: 14px;
-}
-
-.status-chip {
-  padding: 5px 10px;
-  border-radius: 999px;
-  font-size: 12px;
-}
-
-.status-pending {
-  background: #ece6d6;
-  color: #7b6730;
-}
-
-.status-processing {
-  background: #d8e5e2;
-  color: #245a51;
-}
-
-.status-completed {
-  background: #dce7d7;
-  color: #426037;
-}
-
-.status-failed {
-  background: #efd9d3;
-  color: #8b4131;
-}
-
-.warning-list {
-  margin: 0;
-  padding-left: 18px;
-  color: #796746;
-  line-height: 1.5;
-}
-
-.error-text {
-  color: #8b4131;
 }
 
 .scene-stage {
@@ -399,8 +297,18 @@ button:disabled {
 
 .view-switch button {
   min-width: 118px;
+  padding: 12px 14px;
+  border: none;
+  border-radius: 14px;
   background: transparent;
   color: rgba(244, 240, 232, 0.72);
+  font-size: 15px;
+  cursor: pointer;
+}
+
+.view-switch button:disabled {
+  cursor: not-allowed;
+  opacity: 0.56;
 }
 
 .view-switch button.active {
