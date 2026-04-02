@@ -1,8 +1,8 @@
 # 项目阶段 Todo 清单
 
 作者：Bill Billion  
-版本：v1.22  
-日期：2026-04-01  
+版本：v1.23  
+日期：2026-04-02  
 状态：当前阶段追踪清单
 
 ## 说明
@@ -194,3 +194,5 @@ PR-B（质量治理）已完成首轮落地：新增 `ruff` 配置、统一质�
 针对本轮运行时收口补做代码优化专家二次复核：`simulation_runtime.py` 与新增失败注入测试结论为“无 P0/P1/P2”，确认事件日志降级策略与 `action.executed` 写入顺序修复有效。
 
 运行时修复追加复核结论：本轮针对 `backend/app/simulation_runtime.py` 的 best-effort 收口与失败注入测试再次复核，结果为“无 P0/P1/P2”。已确认 `create_session` 的事件日志失败会降级为 warning，不再打断主流程；`action.executed` 已调整为会话状态持久化成功后再写入，避免半提交；新增两条失败注入测试有效覆盖“创建会话时事件日志失败降级”和“会话保存失败时不写 action.executed 事件”。补充人工验证也已确认：若 `action.executed` 自身写失败，命令仍成功，状态已持久化，并会写回 warning。
+
+本轮继续执行阶段 2 质量收敛：已新增 `backend/app/llm_api_utils.py`，把 OpenAI 兼容 endpoint 归一化、响应文本提取、JSON 对象提取统一收敛，并替换 `llm_enhancer.py` 与 `simulation_agents.py` 内部重复 helper，消除两处实现漂移。新增 `backend/tests/test_llm_api_utils.py` 参数化回归锁定 URL 归一化与响应解析行为。当前回归更新为：`.venv/bin/python -m ruff check backend` 通过，`.venv/bin/python -m pytest backend/tests -q` 为 `101 passed`，`npm run build` 通过。本轮尝试调用代码优化专家子代理失败（当前会话无可用子代理），已先执行本地静态复核与全量回归，结论为无阻塞问题；下一轮补做专家复核。剩余待办风险收敛为 1 个 P2：前端最小自动化测试补齐。
