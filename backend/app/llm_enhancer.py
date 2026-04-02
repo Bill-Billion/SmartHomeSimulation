@@ -5,13 +5,13 @@ import json
 import logging
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .domain_rules import default_room_name, merge_warnings
 from .geometry import iter_polygon_edges, point_segment_distance, room_center, segment_overlap
+from .llm_api_utils import extract_json_object, extract_message_content, normalize_chat_endpoint
 from .models import FloorplanSpec, OpeningSpec, Point2D, RoomSpec, RoomType, SceneSpec, WallKind
 
 logger = logging.getLogger(__name__)
@@ -127,7 +127,7 @@ def apply_scene_llm_enhancements(
 
 
 def _request_llm_enhancement(config: LlmRequestConfig, evidence: dict[str, Any]) -> LlmEnhancementResult:
-    endpoint = _normalize_chat_endpoint(config.base_url or "")
+    endpoint = normalize_chat_endpoint(config.base_url or "")
     prompt = _build_llm_prompt(evidence)
     message_content: Any = prompt
     thumbnail = evidence.get("thumbnail_data_url")
@@ -200,7 +200,7 @@ def _request_llm_enhancement(config: LlmRequestConfig, evidence: dict[str, Any])
         ) from exc
 
     try:
-        content = _extract_message_content(response_payload)
+        content = extract_message_content(response_payload)
     except ValueError as exc:
         raise LlmEnhancementFailure(
             category="missing_content",
@@ -209,7 +209,7 @@ def _request_llm_enhancement(config: LlmRequestConfig, evidence: dict[str, Any])
         ) from exc
 
     try:
-        data = _extract_json_object(content)
+        data = extract_json_object(content)
     except (ValueError, json.JSONDecodeError) as exc:
         raise LlmEnhancementFailure(
             category="content_not_json",
@@ -497,47 +497,3 @@ def _looks_like_image_capability_error(text: str) -> bool:
     )
     return any(marker in lowered for marker in markers)
 
-
-def _normalize_chat_endpoint(base_url: str) -> str:
-    normalized = base_url.strip()
-    if not normalized.endswith("/"):
-        normalized = f"{normalized}/"
-    if normalized.endswith("/chat/completions/"):
-        return normalized[:-1]
-    if normalized.endswith("/v1/"):
-        return urljoin(normalized, "chat/completions")
-    return urljoin(normalized, "chat/completions")
-
-
-def _extract_message_content(payload: dict[str, Any]) -> str:
-    choices = payload.get("choices") or []
-    if not choices:
-        raise ValueError("AI 响应为空。")
-    message = choices[0].get("message") or {}
-    content = message.get("content")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        text_parts = []
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                text_parts.append(item.get("text", ""))
-        if text_parts:
-            return "\n".join(text_parts)
-    raise ValueError("AI 响应缺少文本内容。")
-
-
-def _extract_json_object(content: str) -> dict[str, Any]:
-    text = content.strip()
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, dict):
-            return parsed
-    except json.JSONDecodeError:
-        pass
-
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        raise ValueError("AI 响应不是合法 JSON。")
-    return json.loads(text[start : end + 1])

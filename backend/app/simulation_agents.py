@@ -3,13 +3,12 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Any
-from urllib.parse import urljoin
 from uuid import uuid4
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from .llm_api_utils import extract_json_object, extract_message_content, normalize_chat_endpoint
 from .llm_enhancer import LlmRequestConfig
 from .models import (
     ActionProposal,
@@ -230,7 +229,7 @@ def _request_lighting_adjustment(
     default_brightness: int,
     default_color_temp: int,
 ) -> LightingAdjustment:
-    endpoint = _normalize_chat_endpoint(config.base_url or "")
+    endpoint = normalize_chat_endpoint(config.base_url or "")
     prompt = (
         "你是照明参数微调器。你只能返回 JSON，不要包含 markdown。\n"
         "只允许输出字段：brightness(1-100), color_temp(2700-6500), reason。\n"
@@ -281,57 +280,8 @@ def _request_lighting_adjustment(
         raise LightingLlmFailure(user_warning="AI 微调响应不是 JSON，已按规则参数执行。") from exc
 
     try:
-        content = _extract_message_content(response_payload)
-        data = _extract_json_object(content)
+        content = extract_message_content(response_payload)
+        data = extract_json_object(content)
         return LightingAdjustment.model_validate(data)
     except (ValueError, json.JSONDecodeError, ValidationError) as exc:
         raise LightingLlmFailure(user_warning="AI 微调输出格式不合法，已按规则参数执行。") from exc
-
-
-def _normalize_chat_endpoint(base_url: str) -> str:
-    stripped = base_url.strip()
-    if not stripped:
-        return "https://api.openai.com/v1/chat/completions"
-    normalized = stripped.rstrip("/") + "/"
-    if normalized.endswith("/chat/completions/"):
-        return normalized.rstrip("/")
-    if normalized.endswith("/v1/"):
-        return urljoin(normalized, "chat/completions")
-    return urljoin(normalized, "v1/chat/completions")
-
-
-def _extract_message_content(response_payload: dict[str, Any]) -> str:
-    choices = response_payload.get("choices")
-    if not isinstance(choices, list) or not choices:
-        raise ValueError("missing choices")
-
-    message = choices[0].get("message")
-    if not isinstance(message, dict):
-        raise ValueError("missing message")
-
-    content = message.get("content")
-    if isinstance(content, list):
-        texts = []
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "text":
-                text_value = part.get("text")
-                if isinstance(text_value, str):
-                    texts.append(text_value)
-        content = "\n".join(texts)
-
-    if not isinstance(content, str) or not content.strip():
-        raise ValueError("missing content")
-    return content.strip()
-
-
-def _extract_json_object(content: str) -> dict[str, Any]:
-    stripped = content.strip()
-    if stripped.startswith("```"):
-        stripped = stripped.strip("`")
-        stripped = stripped.replace("json", "", 1).strip()
-
-    start = stripped.find("{")
-    end = stripped.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        raise ValueError("json object not found")
-    return json.loads(stripped[start : end + 1])
